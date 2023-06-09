@@ -4,9 +4,6 @@ Summary: Shows ATP scores
 Description: Display tennis scores from a tournament chosen in the dropdown. Shows live matches and if selected, any match completed in the past 24 hours.
 Author: M0ntyP
 
-Note:
-ESPN sometimes shows completed matches as stil being "In Progress" well after they have been completed so those matches will continue to appear as in progress matches. 
-
 v1.1
 Used "post" state for completed matches, this will capture both Final and Retired
 Added handling for when no tournaments are on
@@ -24,6 +21,17 @@ Updated caching function
 
 v1.4
 Current server now indicated in green
+
+v1.4.1
+Fixed bug which appears when player who is serving is not being provided by data feed. Code now checks if that data is present before showing it, or not 
+
+v1.5 - Latest PR version
+Added handling for "scheduled" matches which are actually in progress
+Updated logic that finds player who is serving
+Certain API fields of ESPN data feed showing that the French Open is over? Changed the way an "in progress" tournament is determined using start and end dates
+
+v1.5.1 - In progress version
+Removed timezone - not required
 """
 
 load("encoding/json.star", "json")
@@ -33,12 +41,10 @@ load("render.star", "render")
 load("schema.star", "schema")
 load("time.star", "time")
 
-DEFAULT_TIMEZONE = "Australia/Adelaide"
 SLAM_LIST = ["154-2023", "188-2023", "172-2023", "189-2023"]
 
 def main(config):
-    timezone = config.get("$tz", DEFAULT_TIMEZONE)
-    now = time.now().in_location(timezone)
+    now = time.now()
     RotationSpeed = config.get("speed", "3")
 
     # hold 1 min cache for live scores
@@ -50,6 +56,8 @@ def main(config):
     InProgressMatchList = []
     CompletedMatchList = []
     InProgress = 0
+    diffTournEnd = 0
+    diffTournStart = 0
 
     TestID = "414-2023"
     SelectedTourneyID = config.get("TournamentList", TestID)
@@ -63,9 +71,16 @@ def main(config):
             # Capture the index of the particular event, we'll need this later on
             EventIndex = x
 
-            # if there are 10 items, this means we have matches
-            # if != 10 then call function that says tournament has not started yet
-            if len(ATP_JSON["events"][x]) == 10:
+            # Get start & end date/time of the tournament
+            EndDate = ATP_JSON["events"][x]["endDate"]
+            StartDate = ATP_JSON["events"][x]["date"]
+            EndDate = time.parse_time(EndDate, format = "2006-01-02T15:04Z")
+            StartDate = time.parse_time(StartDate, format = "2006-01-02T15:04Z")
+            diffTournEnd = EndDate - now
+            diffTournStart = StartDate - now
+
+            # check if we are between the start & end date of the tournament
+            if diffTournStart.hours < 0 and diffTournEnd.hours > 0:
                 for y in range(0, len(ATP_JSON["events"][x]["competitions"]), 1):
                     # if the match is "In Progress" and its a singles match, lets add it to the list of in progress matches
                     # And the "In Progress" match started < 24 hrs ago , sometimes the data feed will still show matches as "In Progress" after they have completed
@@ -73,11 +88,24 @@ def main(config):
                     if ATP_JSON["events"][x]["competitions"][y]["status"]["type"]["description"] == "In Progress":
                         if ATP_JSON["events"][x]["competitions"][y]["competitors"][0]["type"] == "athlete":
                             MatchTime = ATP_JSON["events"][EventIndex]["competitions"][y]["date"]
-                            MatchTime = time.parse_time(MatchTime, format = "2006-01-02T15:04Z").in_location(timezone)
-                            diff = MatchTime - now
-                            if diff.hours > -24:
+                            MatchTime = time.parse_time(MatchTime, format = "2006-01-02T15:04Z")
+                            diffMatch = MatchTime - now
+                            if diffMatch.hours > -24:
                                 InProgressMatchList.append(y)
                                 InProgress = InProgress + 1
+
+                    # Another gotcha with the ESPN data feed, some in progress matches are still listed as "Scheduled"
+                    # So check if there is a score listed and if so, add it to the in progress list
+                    if ATP_JSON["events"][x]["competitions"][y]["status"]["type"]["description"] == "Scheduled":
+                        if "linescores" in ATP_JSON["events"][x]["competitions"][y]["competitors"][0]:
+                            if ATP_JSON["events"][x]["competitions"][y]["competitors"][0]["type"] == "athlete":
+                                MatchTime = ATP_JSON["events"][EventIndex]["competitions"][y]["date"]
+                                MatchTime = time.parse_time(MatchTime, format = "2006-01-02T15:04Z")
+                                diffMatch = MatchTime - now
+                                if diffMatch.hours > -24:
+                                    InProgressMatchList.append(y)
+                                    InProgress = InProgress + 1
+
             else:
                 Display1.extend([
                     render.Column(
@@ -118,13 +146,15 @@ def main(config):
         for x in range(0, Number_Events, 1):
             if SelectedTourneyID == ATP_JSON["events"][x]["id"]:
                 EventIndex = x
-                if len(ATP_JSON["events"][x]) == 10:
+
+                # check if we are between the start & end date of the tournament
+                if diffTournStart.hours < 0 and diffTournEnd.hours > 0:
                     for y in range(0, len(ATP_JSON["events"][x]["competitions"]), 1):
                         # if the match is completed ("post") and its a singles match ("athlete") and the start time of the match was < 24 hrs ago, lets add it to the list of completed matches
                         if ATP_JSON["events"][x]["competitions"][y]["status"]["type"]["state"] == "post":
                             if ATP_JSON["events"][x]["competitions"][y]["competitors"][0]["type"] == "athlete":
                                 MatchTime = ATP_JSON["events"][EventIndex]["competitions"][y]["date"]
-                                MatchTime = time.parse_time(MatchTime, format = "2006-01-02T15:04Z").in_location(timezone)
+                                MatchTime = time.parse_time(MatchTime, format = "2006-01-02T15:04Z")
                                 diff = MatchTime - now
                                 if diff.hours > -24:
                                     CompletedMatchList.append(y)
@@ -215,14 +245,19 @@ def getLiveScores(SelectedTourneyID, EventIndex, InProgressMatchList, JSON):
             Player1_ID = JSON["events"][EventIndex]["competitions"][x]["competitors"][0]["id"]
             Player2_Name = JSON["events"][EventIndex]["competitions"][x]["competitors"][1]["athlete"]["shortName"]
             Player2_ID = JSON["events"][EventIndex]["competitions"][x]["competitors"][1]["id"]
-            Server = JSON["events"][EventIndex]["competitions"][x]["situation"]["server"]["$ref"]
-            Server = Server[70:]
-            Server = Server.removesuffix("?lang=en&region=us")
+            #print(Player1_Name)
 
-            if Server == Player1_ID:
-                Player1Color = "#01AF50"
-            elif Server == Player2_ID:
-                Player2Color = "#01AF50"
+            # See if the server details are been captured and then display them if they are there
+            if "situation" in JSON["events"][EventIndex]["competitions"][x]:
+                if "server" in JSON["events"][EventIndex]["competitions"][x]["situation"]:
+                    Server = JSON["events"][EventIndex]["competitions"][x]["situation"]["server"]["$ref"]
+                    Server = Server[70:]
+                    Server = Server.removesuffix("?lang=en&region=us")
+
+                    if Server == Player1_ID:
+                        Player1Color = "#01AF50"
+                    elif Server == Player2_ID:
+                        Player2Color = "#01AF50"
 
             Number_Sets = len(JSON["events"][EventIndex]["competitions"][x]["competitors"][0]["linescores"])
             Player1_Sets = ""
@@ -585,8 +620,9 @@ def notStarted(EventIndex, JSON):
     return Display
 
 def get_schema():
+    TOURNEY_CACHE = 10800  # 3hrs
     ATP_SCORES_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"
-    CacheData = get_cachable_data(ATP_SCORES_URL, 120)
+    CacheData = get_cachable_data(ATP_SCORES_URL, TOURNEY_CACHE)
     ATP_JSON = json.decode(CacheData)
 
     Number_Events = len(ATP_JSON["events"])
@@ -596,9 +632,18 @@ def get_schema():
     TournamentOptions = []
     ActualEvents = 0
 
+    now = time.now()
+
     # Only show "In Progress" tournaments
     for x in range(0, Number_Events, 1):
-        if ATP_JSON["events"][x]["status"]["type"]["state"] == "in":
+        EndDate = ATP_JSON["events"][x]["endDate"]
+        StartDate = ATP_JSON["events"][x]["date"]
+        EndDate = time.parse_time(EndDate, format = "2006-01-02T15:04Z")
+        StartDate = time.parse_time(StartDate, format = "2006-01-02T15:04Z")
+        diffTournEnd = EndDate - now
+        diffTournStart = StartDate - now
+
+        if diffTournStart.hours < 0 and diffTournEnd.hours > 0:
             Event_Name = ATP_JSON["events"][x]["name"]
             Event_ID = ATP_JSON["events"][x]["id"]
             Events.append(Event_Name)
